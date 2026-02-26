@@ -1,0 +1,326 @@
+<script>
+// ====== Canvas setup ======
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+const energyCanvas = document.getElementById("energyCanvas");
+const ectx = energyCanvas.getContext("2d");
+
+// Physics constants
+const GRAVITY = 800; // px/s^2
+const GROUND_Y = 550;
+
+// UI elements
+const restSlider = document.getElementById("restSlider");
+const fricSlider = document.getElementById("fricSlider");
+const restVal = document.getElementById("restVal");
+const fricVal = document.getElementById("fricVal");
+const spawnBtn = document.getElementById("spawnBox");
+const resetBtn = document.getElementById("resetWorld");
+const toggleGraphBtn = document.getElementById("toggleGraph");
+const energyLabel = document.getElementById("energyLabel");
+
+let showGraph = true;
+
+// ====== Vector utilities ======
+function vec(x, y) { return {x, y}; }
+function add(a, b) { return {x:a.x+b.x, y:a.y+b.y}; }
+function sub(a, b) { return {x:a.x-b.x, y:a.y-b.y}; }
+function mul(a, s) { return {x:a.x*s, y:a.y*s}; }
+function dot(a, b) { return a.x*b.x + a.y*b.y; }
+function length(v) { return Math.sqrt(v.x*v.x + v.y*v.y); }
+function normalize(v) { const l=length(v); return l===0?{x:0,y:0}:{x:v.x/l,y:v.y/l}; }
+function perp(v) { return {x:-v.y, y:v.x}; }
+
+// ====== Rigid Body ======
+class RigidBody {
+  constructor(options) {
+    this.position = vec(options.x||0, options.y||0);
+    this.velocity = vec(0,0);
+    this.force = vec(0,0);
+
+    this.angle = options.angle||0;
+    this.angularVelocity = 0;
+    this.torque = 0;
+
+    this.mass = options.mass||1;
+    this.invMass = this.mass>0?1/this.mass:0;
+    this.inertia = options.inertia||1;
+    this.invInertia = this.inertia>0?1/this.inertia:0;
+
+    this.restitution = options.restitution ?? 0.5;
+    this.friction = options.friction ?? 0.4;
+
+    this.color = options.color||"red";
+
+    this.localVertices = options.vertices || [
+      vec(-25,-25), vec(25,-25), vec(25,25), vec(-25,25)
+    ];
+
+    this.isStatic = this.mass === 0;
+    this.angularDamping = 0.98;
+    this.linearDamping = 0.999;
+  }
+
+  applyForce(f) { this.force = add(this.force,f); }
+  applyTorque(t) { this.torque += t; }
+
+  worldVertices() {
+    const c = Math.cos(this.angle), s = Math.sin(this.angle);
+    return this.localVertices.map(v=>({
+      x:this.position.x + v.x*c - v.y*s,
+      y:this.position.y + v.x*s + v.y*c
+    }));
+  }
+
+  integrate(dt) {
+    if(this.isStatic) return;
+
+    // linear
+    const acc = add(vec(0,GRAVITY),mul(this.force,this.invMass));
+    this.velocity = add(this.velocity,mul(acc,dt));
+    this.velocity.x *= this.linearDamping;
+    this.velocity.y *= this.linearDamping;
+    this.position = add(this.position,mul(this.velocity,dt));
+    this.force = vec(0,0);
+
+    // angular
+    const angAcc = this.torque * this.invInertia;
+    this.angularVelocity += angAcc * dt;
+    this.angularVelocity *= this.angularDamping;
+    this.angle += this.angularVelocity * dt;
+    this.torque = 0;
+  }
+
+  draw(ctx) {
+    const verts = this.worldVertices();
+    ctx.beginPath();
+    ctx.moveTo(verts[0].x, verts[0].y);
+    for(let i=1;i<verts.length;i++) ctx.lineTo(verts[i].x, verts[i].y);
+    ctx.closePath();
+    ctx.fillStyle = this.color;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(148,163,184,0.8)";
+    ctx.stroke();
+  }
+}
+
+// ====== SAT collision ======
+function projectPolygon(axis, verts){
+  let min=dot(axis,verts[0]), max=min;
+  for(let i=1;i<verts.length;i++){
+    const p = dot(axis, verts[i]);
+    if(p<min) min=p;
+    if(p>max) max=p;
+  }
+  return {min,max};
+}
+
+function overlapOnAxis(aVerts,bVerts,axis){
+  const projA = projectPolygon(axis,aVerts);
+  const projB = projectPolygon(axis,bVerts);
+  return Math.min(projA.max,projB.max)-Math.max(projA.min,projB.min);
+}
+
+function satCollision(a,b){
+  const vertsA = a.worldVertices();
+  const vertsB = b.worldVertices();
+  let smallestOverlap = Infinity;
+  let smallestAxis = null;
+
+  function getAxes(verts){
+    const axes=[];
+    for(let i=0;i<verts.length;i++){
+      const p1=verts[i], p2=verts[(i+1)%verts.length];
+      const edge=sub(p2,p1);
+      axes.push(normalize(perp(edge)));
+    }
+    return axes;
+  }
+
+  const axes = [...getAxes(vertsA),...getAxes(vertsB)];
+  for(const axis of axes){
+    const o = overlapOnAxis(vertsA,vertsB,axis);
+    if(o<=0) return null;
+    if(o<smallestOverlap){smallestOverlap=o; smallestAxis=axis;}
+  }
+
+  const centerDelta = sub(b.position,a.position);
+  if(dot(centerDelta,smallestAxis)<0) smallestAxis=mul(smallestAxis,-1);
+  return {normal:smallestAxis,penetration:smallestOverlap};
+}
+
+// ====== Collision resolution ======
+function resolveCollision(a,b,col){
+  const normal = col.normal;
+  const totalInvMass = a.invMass + b.invMass;
+  if(totalInvMass===0) return;
+
+  // position correction
+  const percent = 0.8;
+  const slop = 0.01;
+  const correction = Math.max(col.penetration-slop,0)/totalInvMass*percent;
+  a.position = sub(a.position,mul(normal,correction*a.invMass));
+  b.position = add(b.position,mul(normal,correction*b.invMass));
+
+  // relative velocity
+  const rv = sub(b.velocity,a.velocity);
+  const velAlongNormal = dot(rv,normal);
+  if(velAlongNormal>0) return;
+
+  const e = Math.min(a.restitution,b.restitution);
+  const j = -(1+e)*velAlongNormal/totalInvMass;
+  const impulse = mul(normal,j);
+  a.velocity = sub(a.velocity,mul(impulse,a.invMass));
+  b.velocity = add(b.velocity,mul(impulse,b.invMass));
+
+  // friction
+  const tangent = normalize(sub(rv,mul(normal,velAlongNormal)));
+  const jt = -dot(rv,tangent)/totalInvMass;
+  const mu = (a.friction+b.friction)/2;
+  const frictionImpulse = Math.abs(jt)<j*mu?mul(tangent,jt):mul(tangent,-j*mu);
+  a.velocity = sub(a.velocity,mul(frictionImpulse,a.invMass);
+  b.velocity = add(b.velocity,mul(frictionImpulse,b.invMass);
+}
+
+// ====== World setup ======
+const bodies = [];
+const energyHistory = [];
+const maxEnergyPoints = 400;
+
+// Ground
+bodies.push(new RigidBody({
+  x:canvas.width/2, y:GROUND_Y, mass:0, inertia:0,
+  color:"#16a34a", restitution:0.2, friction:0.9,
+  vertices:[vec(-450,-20),vec(450,-20),vec(450,40),vec(-450,40)]
+}));
+
+// Initial dynamic boxes
+bodies.push(new RigidBody({
+  x:300,y:80,mass:2,inertia:2000,color:"#f97316",
+  restitution:0.5,friction:0.4,
+  vertices:[vec(-30,-30),vec(30,-30),vec(30,30),vec(-30,30)]
+}));
+bodies.push(new RigidBody({
+  x:500,y:40,mass:1.5,inertia:1500,color:"#38bdf8",
+  restitution:0.6,friction:0.3,
+  vertices:[vec(-25,-40),vec(25,-40),vec(35,40),vec(-35,40)]
+}));
+
+// ====== Energy ======
+function computeTotalEnergy(){
+  let total=0;
+  for(const b of bodies){
+    if(b.isStatic) continue;
+    const v2 = dot(b.velocity,b.velocity);
+    const KE = 0.5*b.mass*v2;
+    const height = Math.max(0,GROUND_Y-b.position.y);
+    const PE = b.mass*GRAVITY*(height/100);
+    total += KE+PE;
+  }
+  return total;
+}
+
+function updateEnergyHistory(){
+  const E = computeTotalEnergy();
+  energyHistory.push(E);
+  if(energyHistory.length>maxEnergyPoints) energyHistory.shift();
+  energyLabel.textContent = `Total: ${E.toFixed(1)}`;
+}
+
+function drawEnergyGraph(){
+  if(!showGraph) return;
+  ectx.clearRect(0,0,energyCanvas.width,energyCanvas.height);
+  ectx.fillStyle="#020617";
+  ectx.fillRect(0,0,energyCanvas.width,energyCanvas.height);
+  if(energyHistory.length<2) return;
+  const maxE = Math.max(...energyHistory)||1;
+  const w=energyCanvas.width, h=energyCanvas.height;
+  ectx.strokeStyle="#22c55e"; ectx.lineWidth=2; ectx.beginPath();
+  for(let i=0;i<energyHistory.length;i++){
+    const x=(i/(maxEnergyPoints-1))*w;
+    const y=h-(energyHistory[i]/maxE)*(h-10)-5;
+    if(i===0) ectx.moveTo(x,y); else ectx.lineTo(x,y);
+  }
+  ectx.stroke();
+  ectx.strokeStyle="rgba(148,163,184,0.4)";
+  ectx.beginPath(); ectx.moveTo(0,h-1); ectx.lineTo(w,h-1); ectx.stroke();
+}
+
+// ====== Update & draw ======
+function update(dt){
+  const globalRest = parseFloat(restSlider.value);
+  const globalFric = parseFloat(fricSlider.value);
+
+  for(const b of bodies){ if(!b.isStatic){b.restitution=globalRest;b.friction=globalFric;} }
+
+  bodies.forEach((b,i)=>{ if(!b.isStatic){ const t = i%2===0?4000:-3000; b.applyTorque(t); } });
+  bodies.forEach(b=>b.integrate(dt));
+
+  for(let i=0;i<bodies.length;i++){
+    for(let j=i+1;j<bodies.length;j++){
+      const col = satCollision(bodies[i],bodies[j]);
+      if(col) resolveCollision(bodies[i],bodies[j],col);
+    }
+  }
+
+  const groundTop = GROUND_Y-20;
+  for(const b of bodies){
+    if(!b.isStatic){
+      const verts = b.worldVertices();
+      const bottomY = Math.max(...verts.map(v=>v.y));
+      if(bottomY>groundTop){ b.position.y -= bottomY-groundTop; b.velocity.y=0; }
+    }
+  }
+
+  updateEnergyHistory();
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle="#020617"; ctx.fillRect(0,0,canvas.width,canvas.height);
+  bodies.forEach(b=>b.draw(ctx));
+  drawEnergyGraph();
+}
+
+// ====== Loop ======
+const FIXED_DT = 1/60;
+function loop(){
+  for(let i=0;i<3;i++) update(FIXED_DT); // substeps
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ====== UI events ======
+restSlider.addEventListener("input",()=>restVal.textContent=restSlider.value);
+fricSlider.addEventListener("input",()=>fricVal.textContent=fricSlider.value);
+
+spawnBtn.addEventListener("click",()=>{
+  const x = 200+Math.random()*500, y=0;
+  const w = 20+Math.random()*40, h = 20+Math.random()*40;
+  const mass = 0.5+Math.random()*2;
+  const colors = ["#f97316","#38bdf8","#a855f7","#facc15","#22c55e"];
+  const color = colors[Math.floor(Math.random()*colors.length)];
+
+  bodies.push(new RigidBody({
+    x,y,mass,
+    inertia:(w*w+h*h)*mass*0.1,
+    color,
+    restitution:parseFloat(restSlider.value),
+    friction:parseFloat(fricSlider.value),
+    vertices:[vec(-w/2,-h/2),vec(w/2,-h/2),vec(w/2,h/2),vec(-w/2,h/2)]
+  }));
+});
+
+resetBtn.addEventListener("click",()=>{
+  bodies.splice(1,bodies.length-1);
+  energyHistory.length=0;
+});
+
+toggleGraphBtn.addEventListener("click",()=>{
+  showGraph = !showGraph;
+  energyCanvas.style.display = showGraph?"block":"none";
+  toggleGraphBtn.textContent = showGraph?"Hide Graph":"Show Graph";
+});
+</script>

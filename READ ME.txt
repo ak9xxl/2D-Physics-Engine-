@@ -1,0 +1,39 @@
+2D Physics Engine Sandbox
+A real‑time 2D physics engine built from scratch to explore rigid‑body dynamics, SAT collision detection, impulse resolution, torque, friction, restitution, and numerical stability. Includes a full UI and live energy graph.
+Features
+- Convex polygon rigid bodies
+- SAT collision detection
+- Impulse‑based collision response
+- Torque and angular momentum
+- Friction and restitution
+- Gravity control
+- Energy graph (kinetic + potential)
+- UI sliders for physics parameters
+- Spawn/reset controls
+- Clean dark‑theme interface
+
+How it works
+The engine simulates rigid bodies using Newton’s laws:
+- Linear motion:
+v=v+a\cdot dt
+x=x+v\cdot dt
+- Rotational motion:
+\omega =\omega +\alpha \cdot dt
+\theta =\theta +\omega \cdot dt
+Collisions are detected using the Separating Axis Theorem (SAT). When two bodies overlap, an impulse is computed based on relative velocity, restitution, and friction to separate them and simulate realistic bouncing and sliding.
+The energy graph visualizes total mechanical energy over time, revealing numerical drift and stability characteristics of the integrator.
+What I learned
+- How rigid‑body physics engines work internally
+- How SAT detects polygon collisions
+- How impulses resolve collisions
+- How torque and inertia affect rotation
+- How numerical errors cause energy drift
+- How to design interactive simulation tools
+
+Future improvements
+- Semi‑implicit Euler or Verlet integration
+- Continuous collision detection
+- Impulse clamping
+- Better stacking stability
+- More shapes (circles, capsules)
+
